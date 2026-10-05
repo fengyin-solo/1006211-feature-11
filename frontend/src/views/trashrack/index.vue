@@ -3,135 +3,198 @@
     <header class="page-head">
       <div>
         <h2>拦污栅管理</h2>
-        <p class="page-desc">维护拦污栅，围绕栅体编号、所属机组、前后压差、清污次数做登记、筛选与状态流转。</p>
-      </div>
-      <div class="page-actions">
-        <button class="btn primary" type="button" @click="openCreate">登记拦污栅</button>
-        <button class="btn" type="button" @click="exportRows">导出拦污栅清单</button>
+        <p class="page-desc">清污结果与闸门页同一口径：跨页清污条数相同；两套取值有争议时以较晚产生的一套为准并统一。</p>
       </div>
     </header>
 
-    <div class="stat-row">
-      <article v-for="item in stats" :key="item.label" class="stat-card">
-        <span class="stat-label">{{ item.label }}</span>
-        <strong class="stat-value">{{ item.value }}</strong>
-      </article>
+    <div class="rule-banner">
+      当前身份：<strong>{{ session.actor.name }}（{{ crewName(session.actor.crewCode) }} · {{ session.actor.role }}）</strong>
+      ｜观测岗只读；运行岗、检修岗可安排清理/确认完成。台账合计自动同步闸门页清污口径。
     </div>
 
-    <p class="status-legend">
-      <span v-for="item in statusSummary" :key="item.status" class="legend-item">
-        {{ item.status }}：{{ item.count }}
-      </span>
-    </p>
-
-    <form class="filter-bar" @submit.prevent="reload">
-      <label v-for="field in filterFields" :key="field" class="filter-item">
-        <span>{{ field }}</span>
-        <input v-model="filters[field]" :placeholder="`按${field}检索`" />
-      </label>
-      <button class="btn" type="submit">查询</button>
-      <button class="btn ghost" type="button" @click="resetFilters">重置条件</button>
-    </form>
+    <div class="stat-row">
+      <article class="stat-card">
+        <span class="stat-label">待清理</span>
+        <strong class="stat-value">{{ stats.todo }}</strong>
+      </article>
+      <article class="stat-card">
+        <span class="stat-label">已清理</span>
+        <strong class="stat-value">{{ stats.done }}</strong>
+      </article>
+      <article class="stat-card">
+        <span class="stat-label">台账清污合计</span>
+        <strong class="stat-value">{{ ledgerTotal }} 条</strong>
+      </article>
+      <article class="stat-card highlight">
+        <span class="stat-label">跨页统一清污条数（闸门页相同）</span>
+        <strong class="stat-value">{{ canonicalTotal }} 条</strong>
+      </article>
+    </div>
 
     <table class="data-table">
       <thead>
         <tr>
-          <th v-for="column in columns" :key="column">{{ column }}</th>
-          <th>当前状态</th>
-          <th>可执行动作</th>
+          <th>栅体编号</th>
+          <th>所属机组</th>
+          <th>前后压差(m)</th>
+          <th>清污次数</th>
+          <th>清污方式</th>
+          <th>清理日期</th>
+          <th>清理人员</th>
+          <th>状态</th>
+          <th>操作</th>
         </tr>
       </thead>
       <tbody>
-        <tr v-for="row in rows" :key="String(row.id)">
-          <td v-for="column in columns" :key="column">{{ row[column] ?? '—' }}</td>
-          <td>{{ row.status }}</td>
+        <tr v-for="row in rows" :key="row.id">
+          <td>{{ row.栅体编号 }}</td>
+          <td>{{ row.所属机组 }}</td>
+          <td>{{ row.前后压差 }}</td>
+          <td>{{ row.清污次数 }}</td>
+          <td>{{ row.清污方式 || '—' }}</td>
+          <td>{{ row.清理日期 }}</td>
+          <td>{{ row.清理人员 || '—' }}</td>
+          <td><span :class="['status-pill', rackStatusClass(row.栅体状态)]">{{ row.栅体状态 }}</span></td>
           <td class="row-actions">
-            <button
-              v-for="action in actions"
-              :key="action"
-              class="link"
-              type="button"
-              @click="runAction(action, row)"
-            >
-              {{ action }}
-            </button>
+            <template v-if="session.isReadonly">
+              <span class="muted-link">只读</span>
+            </template>
+            <template v-else>
+              <button v-if="row.栅体状态 === '待清理'" class="link" type="button" @click="call(() => scheduleCleaning(row.id, session.actor))">安排清理</button>
+              <button v-if="row.栅体状态 === '清理中'" class="link" type="button" @click="openComplete(row)">确认完成</button>
+              <button class="link" type="button" @click="call(() => reportRackDamage(row.id, session.actor))">登记损坏</button>
+            </template>
           </td>
         </tr>
         <tr v-if="!rows.length">
-          <td :colspan="columns.length + 2" class="empty-state">暂无拦污栅数据，可先登记拦污栅</td>
+          <td colspan="9" class="empty-state">暂无拦污栅数据</td>
         </tr>
       </tbody>
     </table>
 
     <footer class="page-foot">
-      <span>共 {{ total }} 条拦污栅记录</span>
-      <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
+      <span>共 {{ rows.length }} 台拦污栅</span>
+      <span v-if="message" :class="messageOk ? 'ok-text' : 'error-text'">{{ message }}</span>
     </footer>
+
+    <Modal :open="completeModal" title="确认清污完成" @close="completeModal = false">
+      <div class="form-row">
+        <label>栅体</label>
+        <div>{{ activeRow?.栅体编号 }}（{{ activeRow?.所属机组 }}）</div>
+      </div>
+      <div class="form-row">
+        <label>本次清污条数</label>
+        <input v-model.number="cleanCount" type="number" min="1" step="1" />
+      </div>
+      <div class="form-row">
+        <label>清污方式</label>
+        <input v-model="cleanWay" placeholder="清污机抓取 / 人工配合" />
+      </div>
+      <template #footer>
+        <button class="btn" type="button" @click="completeModal = false">取消</button>
+        <button class="btn primary" type="button" @click="confirmComplete">确认并同步两页条数</button>
+      </template>
+    </Modal>
   </section>
 </template>
 
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 
+import Modal from '@/components/Modal.vue'
 import {
-  downloadEntries,
-  listEntries,
-  moduleMeta,
-  runAction as applyAction,
-} from '@/api/local-service'
-import type { EntryRow } from '@/data/types'
+  canonicalCleaningTotal,
+  completeCleaning,
+  ledgerCleaningTotal,
+  listRacks,
+  reportRackDamage,
+  scheduleCleaning,
+} from '@/domain/trashrack-service'
+import { crewName } from '@/domain/identity'
+import { useNoticeStore } from '@/stores/notice'
+import { useSessionStore } from '@/stores/session'
+import type { ActionResult, TrashrackRow } from '@/domain/types'
 
-const meta = moduleMeta('trashrack')
-const columns = ["栅体编号", "所属机组", "前后压差", "清污次数", "清污方式", "清理日期", "清理人员", "栅体状态"]
-const actions = ["安排清理", "确认完成", "登记损坏"]
-const statuses = ["待清理", "清理中", "已清理", "已损坏"]
-const stats = [{"label": "待清理栅体", "value": 0}, {"label": "已清理栅体", "value": 0}, {"label": "最大压差", "value": 0}]
+const session = useSessionStore()
+const notice = useNoticeStore()
 
-const rows = ref<EntryRow[]>([])
-const total = ref(0)
-const errorMessage = ref('')
-const filters = ref<Record<string, string>>({})
-const filterFields = columns.slice(0, 3)
-const statusSummary = computed(() =>
-  statuses.map((status: string) => ({
-    status,
-    count: rows.value.filter((row) => String(row.status) === status).length,
-  })),
-)
+const rows = ref<TrashrackRow[]>([])
+const message = ref('')
+const messageOk = ref(false)
+const completeModal = ref(false)
+const activeRow = ref<TrashrackRow | null>(null)
+const cleanCount = ref(1)
+const cleanWay = ref('清污机抓取')
 
-function resetFilters() {
-  filters.value = {}
+const ledgerTotal = ref(0)
+const canonicalTotal = ref(0)
+
+const stats = computed(() => ({
+  todo: rows.value.filter((row) => row.栅体状态 === '待清理' || row.栅体状态 === '清理中').length,
+  done: rows.value.filter((row) => row.栅体状态 === '已清理').length,
+}))
+
+function rackStatusClass(status: string): string {
+  if (status === '已清理') return 'pill-open'
+  if (status === '已损坏') return 'pill-fault'
+  return 'pill-warn'
+}
+
+function openComplete(row: TrashrackRow): void {
+  activeRow.value = row
+  cleanCount.value = 1
+  cleanWay.value = '清污机抓取'
+  completeModal.value = true
+}
+function confirmComplete(): void {
+  if (!activeRow.value) return
+  completeModal.value = false
+  call(() =>
+    completeCleaning(activeRow.value!.id, session.actor, {
+      清污方式: cleanWay.value,
+      条数: cleanCount.value,
+    }),
+  )
+}
+
+function call(fn: () => ActionResult): void {
+  const result = fn()
+  message.value = result.message
+  messageOk.value = result.ok
   reload()
+  notice.refresh()
 }
 
-function exportRows() {
-  downloadEntries(meta.key)
+function reload(): void {
+  rows.value = listRacks()
+  ledgerTotal.value = ledgerCleaningTotal()
+  canonicalTotal.value = canonicalCleaningTotal()
 }
 
-function openCreate() {
-  errorMessage.value = '拦污栅登记入口尚未接入审批流'
-}
-
-function runAction(action: string, row: EntryRow) {
-  errorMessage.value = ''
-  const result = applyAction(meta.key, Number(row.id), action)
-  if (!result.ok) {
-    errorMessage.value = result.message
-    return
-  }
+onMounted(() => {
   reload()
-}
-
-function reload() {
-  errorMessage.value = ''
-  try {
-    const payload = listEntries(meta.key, filters.value)
-    rows.value = payload.items
-    total.value = payload.total
-  } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : '拦污栅列表读取失败'
-  }
-}
-
-onMounted(reload)
+  notice.refresh()
+})
 </script>
+
+<style scoped>
+.rule-banner {
+  background: #eef5ff;
+  border: 1px solid #bfd7ff;
+  color: #1e4a8a;
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 13px;
+  margin-bottom: 12px;
+}
+.stat-card.highlight { border-color: #1f6feb; background: #f3f8ff; }
+.status-pill { border-radius: 999px; padding: 2px 10px; font-size: 12px; }
+.pill-open { background: #e3f9ec; color: #067647; }
+.pill-warn { background: #fff4e0; color: #9a5b00; }
+.pill-fault { background: #fdecec; color: #b42318; }
+.muted-link { color: var(--muted); font-size: 12px; }
+.ok-text { color: #067647; }
+.form-row { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
+.form-row label { font-size: 12px; color: var(--muted); }
+.form-row input { border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; font: inherit; }
+</style>
