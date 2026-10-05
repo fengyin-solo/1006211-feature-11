@@ -1,12 +1,15 @@
 <template>
   <section class="page" data-module="trashrack">
+    <NoticePanel compact />
+
     <header class="page-head">
       <div>
         <h2>拦污栅管理</h2>
-        <p class="page-desc">维护拦污栅，围绕栅体编号、所属机组、前后压差、清污次数做登记、筛选与状态流转。</p>
+        <p class="page-desc">
+          清污条数以共享清污台账为准：本页与闸门启闭页读到的是同一个数，重复清污提交同一时段只保留一笔。历史无清理人的按清污责任班组补记。
+        </p>
       </div>
       <div class="page-actions">
-        <button class="btn primary" type="button" @click="openCreate">登记拦污栅</button>
         <button class="btn" type="button" @click="exportRows">导出拦污栅清单</button>
       </div>
     </header>
@@ -22,6 +25,7 @@
       <span v-for="item in statusSummary" :key="item.status" class="legend-item">
         {{ item.status }}：{{ item.count }}
       </span>
+      <span class="legend-item">清污台账总条数：{{ totalClean }}</span>
     </p>
 
     <form class="filter-bar" @submit.prevent="reload">
@@ -43,30 +47,49 @@
       </thead>
       <tbody>
         <tr v-for="row in rows" :key="String(row.id)">
-          <td v-for="column in columns" :key="column">{{ row[column] ?? '—' }}</td>
+          <td v-for="column in columns" :key="column">
+            <template v-if="column === '清污次数'">
+              <strong>{{ liveCount(row) }}</strong>
+              <span v-if="Number(row[column]) !== liveCount(row)" class="badge blocked">原记{{ row[column] }}，已按台账统一</span>
+            </template>
+            <template v-else>{{ row[column] ?? '—' }}</template>
+          </td>
           <td>{{ row.status }}</td>
           <td class="row-actions">
-            <button
-              v-for="action in actions"
-              :key="action"
-              class="link"
-              type="button"
-              @click="runAction(action, row)"
-            >
-              {{ action }}
-            </button>
+            <button class="link" type="button" @click="genericAction('安排清理', row)">安排清理</button>
+            <button class="link" type="button" @click="confirmClean(row)">确认完成（记清污台账）</button>
+            <button class="link" type="button" @click="genericAction('登记损坏', row)">登记损坏</button>
           </td>
         </tr>
         <tr v-if="!rows.length">
-          <td :colspan="columns.length + 2" class="empty-state">暂无拦污栅数据，可先登记拦污栅</td>
+          <td :colspan="columns.length + 2" class="empty-state">暂无拦污栅数据</td>
         </tr>
       </tbody>
     </table>
 
     <footer class="page-foot">
-      <span>共 {{ total }} 条拦污栅记录</span>
-      <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
+      <span>共 {{ total }} 条拦污栅记录 · 台账 {{ totalClean }} 条清污记录</span>
+      <span v-if="message" class="error-text">{{ message }}</span>
     </footer>
+
+    <section class="sub-panel">
+      <h3>清污台账（与闸门台账同源，跨页清污条数相同）</h3>
+      <table class="data-table">
+        <thead>
+          <tr><th>清理时间</th><th>栅体编号</th><th>关联闸门</th><th>清理人</th><th>班组</th><th>备注</th></tr>
+        </thead>
+        <tbody>
+          <tr v-for="entry in cleanLedger" :key="entry.id">
+            <td>{{ entry.cleanedAt }}</td>
+            <td>{{ entry.rackNo }}</td>
+            <td>{{ entry.gateNo || '—' }}</td>
+            <td>{{ entry.operator }}</td>
+            <td>{{ entry.crew }}</td>
+            <td>{{ entry.note ?? (entry.source === 'history-backfill' ? '历史回填' : '') }}</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
   </section>
 </template>
 
@@ -80,24 +103,44 @@ import {
   runAction as applyAction,
 } from '@/api/local-service'
 import type { EntryRow } from '@/data/types'
+import { useSessionStore } from '@/stores/session'
+import { useNoticeStore } from '@/stores/notice'
+import NoticePanel from '@/components/NoticePanel.vue'
+import { cleanCountByRack, listCleanLedger, recordCleaning } from '@/domain/gate-service'
 
 const meta = moduleMeta('trashrack')
-const columns = ["栅体编号", "所属机组", "前后压差", "清污次数", "清污方式", "清理日期", "清理人员", "栅体状态"]
-const actions = ["安排清理", "确认完成", "登记损坏"]
-const statuses = ["待清理", "清理中", "已清理", "已损坏"]
-const stats = [{"label": "待清理栅体", "value": 0}, {"label": "已清理栅体", "value": 0}, {"label": "最大压差", "value": 0}]
+const session = useSessionStore()
+const notice = useNoticeStore()
+
+const columns = ['栅体编号', '所属机组', '前后压差', '清污次数', '清污方式', '关联闸门', '清理日期', '清理人员']
+const statuses = ['待清理', '清理中', '已清理', '已损坏']
 
 const rows = ref<EntryRow[]>([])
 const total = ref(0)
-const errorMessage = ref('')
+const message = ref('')
 const filters = ref<Record<string, string>>({})
 const filterFields = columns.slice(0, 3)
+const cleanLedger = ref(listCleanLedger())
+const counts = ref<Record<number, number>>({})
+
+const totalClean = computed(() => cleanLedger.value.length)
+const stats = computed(() => [
+  { label: '待清理栅体', value: rows.value.filter((row) => String(row.status) === '待清理').length },
+  { label: '已清理栅体', value: rows.value.filter((row) => String(row.status) === '已清理').length },
+  { label: '累计清污条数', value: totalClean.value },
+  { label: '最大压差', value: rows.value.reduce((max, row) => Math.max(max, Number(String(row.前后压差).replace('m', '')) || 0), 0).toFixed(1) + 'm' },
+])
+
 const statusSummary = computed(() =>
-  statuses.map((status: string) => ({
+  statuses.map((status) => ({
     status,
     count: rows.value.filter((row) => String(row.status) === status).length,
   })),
 )
+
+function liveCount(row: EntryRow): number {
+  return counts.value[Number(row.id)] ?? Number(row.清污次数) ?? 0
+}
 
 function resetFilters() {
   filters.value = {}
@@ -108,29 +151,27 @@ function exportRows() {
   downloadEntries(meta.key)
 }
 
-function openCreate() {
-  errorMessage.value = '拦污栅登记入口尚未接入审批流'
+function genericAction(action: string, row: EntryRow) {
+  const result = applyAction(meta.key, Number(row.id), action)
+  message.value = result.message
+  reload()
+  notice.refresh(session.crewName)
 }
 
-function runAction(action: string, row: EntryRow) {
-  errorMessage.value = ''
-  const result = applyAction(meta.key, Number(row.id), action)
-  if (!result.ok) {
-    errorMessage.value = result.message
-    return
-  }
+function confirmClean(row: EntryRow) {
+  const result = recordCleaning({ rackId: Number(row.id), operator: session.operator, crew: session.crewName })
+  message.value = result.message
   reload()
+  notice.refresh(session.crewName)
 }
 
 function reload() {
-  errorMessage.value = ''
-  try {
-    const payload = listEntries(meta.key, filters.value)
-    rows.value = payload.items
-    total.value = payload.total
-  } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : '拦污栅列表读取失败'
-  }
+  message.value = ''
+  const payload = listEntries(meta.key, filters.value)
+  rows.value = payload.items
+  total.value = payload.total
+  cleanLedger.value = listCleanLedger()
+  counts.value = cleanCountByRack()
 }
 
 onMounted(reload)
